@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Garden Tower Defense</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#14251b;color:white;font-family:Arial,sans-serif;text-align:center}
+h1{color:#8cff8c;margin:12px}
+#top{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin:10px}
+.stat{background:#263e2c;padding:9px 14px;border-radius:9px}
+button{background:#398b45;color:white;border:0;padding:10px 13px;margin:4px;border-radius:8px;font-weight:bold;cursor:pointer}
+button:hover{background:#55b85e}
+button:disabled{opacity:.4;cursor:not-allowed}
+#game{width:min(96vw,900px);height:auto;border:3px solid #7cbd70;border-radius:10px;background:#8acb69;cursor:crosshair;touch-action:manipulation}
+#shop,#actions{max-width:920px;margin:10px auto;padding:8px}
+.towerButton{background:#345e3c}
+.selected{outline:3px solid yellow}
+#info{min-height:45px;color:#d7ffd7;padding:8px}
+.small{font-size:12px;color:#c9e5c9}
+</style>
+</head>
+<body>
+<h1>🌻 Garden Tower Defense 🌻</h1>
+<div id="top">
+ <div class="stat">💰 Money: $<span id="money">50000</span></div>
+ <div class="stat">🌱 Garden HP: <span id="hp">100</span></div>
+ <div class="stat">🌊 Wave: <span id="wave">0</span></div>
+ <div class="stat">👾 Enemies: <span id="enemies">0</span></div>
+</div>
+<div id="actions">
+ <button id="start">Start Wave</button>
+ <button id="skip">⏭ Skip Wave</button>
+ <button id="speed">Speed: x1</button>
+ <button id="pause">Pause</button>
+</div>
+<canvas id="game" width="900" height="490"></canvas>
+<div id="shop">
+ <h3>🌼 Choose a Tower</h3>
+ <button class="towerButton" data-type="echo">Echosonic Bloom ($1,800)</button>
+ <button class="towerButton" data-type="carrot">Carrotastrophe ($2,400)</button>
+ <button class="towerButton" data-type="orb">Orbarrage Bloom ($3,500)</button>
+ <button class="towerButton" data-type="void">Voidanium ($2,800)</button>
+ <button class="towerButton" data-type="scop">Scopleaf ($6,500)</button>
+</div>
+<div id="info">Choose a tower, then click an empty grass area to place it.</div>
+<div id="actions">
+ <button id="upgrade" disabled>⬆ Upgrade</button>
+ <button id="sell" disabled>💰 Sell</button>
+ <button id="sonic" disabled>💥 Sonic Blast</button>
+</div>
+<p class="small">Maximum level 5 · Maximum 5 of each tower · Boss every 50 waves</p>
+
+<script>
+const canvas=document.getElementById("game");
+const ctx=canvas.getContext("2d");
+const $=id=>document.getElementById(id);
+
+const types={
+ echo:{name:"Echosonic Bloom",cost:1800,range:190,interval:.65,color:"#ffe65c",emoji:"🔔"},
+ carrot:{name:"Carrotastrophe",cost:2400,range:150,interval:.95,color:"#ff963d",emoji:"🥕"},
+ orb:{name:"Orbarrage Bloom",cost:3500,range:230,interval:1.35,color:"#66eaff",emoji:"🔮"},
+ void:{name:"Voidanium",cost:2800,range:205,interval:1.05,color:"#bd83ff",emoji:"🟣"},
+ scop:{name:"Scopleaf",cost:6500,range:260,interval:999,color:"#50ff8b",emoji:"🍃"}
+};
+
+let money=50000,baseHP=100,wave=0;
+let towers=[],enemies=[],projectiles=[],particles=[];
+let selectedType=null,selectedTower=null;
+let running=false,paused=false,speed=1;
+let spawnLeft=0,spawnTimer=0,lastTime=0;
+let nextWaveQueued=false;
+
+const path=[
+ {x:-20,y:90},{x:170,y:90},{x:170,y:360},
+ {x:370,y:360},{x:370,y:150},{x:580,y:150},
+ {x:580,y:390},{x:760,y:390},{x:760,y:245},{x:830,y:245}
+];
+
+function distance(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function updateUI(){
+ $("money").textContent=Math.floor(money);
+ $("hp").textContent=Math.floor(baseHP);
+ $("wave").textContent=wave;
+ $("enemies").textContent=enemies.length;
+ $("upgrade").disabled=!selectedTower||selectedTower.level>=5;
+ $("sell").disabled=!selectedTower;
+ $("sonic").disabled=!selectedTower||selectedTower.type!=="echo"||selectedTower.cooldown>0;
+ $("sonic").textContent=selectedTower&&selectedTower.cooldown>0?
+   "Sonic Blast ("+selectedTower.cooldown.toFixed(1)+"s)":"💥 Sonic Blast";
+}
+
+function startWave(){
+ if(!running){running=true;wave=0;}
+ if(spawnLeft>0)return;
+ wave++;
+ spawnLeft=wave%50===0?1:Math.min(8+wave*2,100);
+ spawnTimer=0;
+ nextWaveQueued=false;
+ updateUI();
+}
+$("start").onclick=startWave;
+$("skip").onclick=()=>{
+ if(!running){startWave();return;}
+ nextWaveQueued=true;
+ if(spawnLeft===0)startWave();
+};
+$("speed").onclick=()=>{
+ speed=speed===1?5:1;
+ $("speed").textContent="Speed: x"+speed;
+};
+$("pause").onclick=()=>{
+ paused=!paused;
+ $("pause").textContent=paused?"Resume":"Pause";
+};
+
+document.querySelectorAll(".towerButton").forEach(b=>{
+ b.onclick=()=>{
+  selectedType=b.dataset.type;
+  selectedTower=null;
+  document.querySelectorAll(".towerButton").forEach(x=>x.classList.remove("selected"));
+  b.classList.add("selected");
+  $("info").textContent="Selected "+types[selectedType].name+". Click the grass to place it.";
+  updateUI();
+ };
+});
+
+function pointOnPath(x,y){
+ for(let i=0;i<path.length-1;i++){
+  const a=path[i],b=path[i+1];
+  const dx=b.x-a.x,dy=b.y-a.y;
+  const t=Math.max(0,Math.min(1,((x-a.x)*dx+(y-a.y)*dy)/(dx*dx+dy*dy)));
+  if(Math.hypot(x-(a.x+t*dx),y-(a.y+t*dy))<36)return true;
+ }
+ return false;
+}
+
+canvas.addEventListener("click",e=>{
+ const r=canvas.getBoundingClientRect();
+ const x=(e.clientX-r.left)*canvas.width/r.width;
+ const y=(e.clientY-r.top)*canvas.height/r.height;
+
+ const found=towers.find(t=>distance(t,{x,y})<22);
+ if(found){
+  selectedTower=found;selectedType=null;
+  $("info").textContent=types[found.type].name+" · Level "+found.level+
+   " · Damage "+Math.floor(2500*found.level*found.buff)+" DPS";
+  updateUI();return;
+ }
+ if(!selectedType)return;
+ const type=types[selectedType];
+ if(money<type.cost){$("info").textContent="Not enough money!";return;}
+ if(towers.filter(t=>t.type===selectedType).length>=5){
+  $("info").textContent="You can only place 5 of this tower!";return;
+ }
+ if(pointOnPath(x,y)||x>790&&y>200&&y<290||
+    towers.some(t=>distance(t,{x,y})<45)){
+  $("info").textContent="You cannot place a tower there!";return;
+ }
+ money-=type.cost;
+ towers.push({x,y,type:selectedType,level:1,cooldown:0,sonic:0,buff:1});
+ selectedTower=towers[towers.length-1];
+ selectedType=null;
+ $("info").textContent=type.name+" placed!";
+ updateUI();
+});
+
+$("upgrade").onclick=()=>{
+ if(!selectedTower||selectedTower.level>=5)return;
+ const cost=selectedTower.level*1200;
+ if(money<cost){$("info").textContent="Not enough money!";return;}
+ money-=cost;selectedTower.level++;
+ $("info").textContent="Tower upgraded to level "+selectedTower.level+"!";
+ updateUI();
+};
+$("sell").onclick=()=>{
+ if(!selectedTower)return;
+ const t=selectedTower;
+ money+=Math.floor(types[t.type].cost*.6)+700*(t.level-1);
+ towers=towers.filter(x=>x!==t);
+ selectedTower=null;
+ $("info").textContent="Tower sold!";
+ updateUI();
+};
+
+$("sonic").onclick=()=>{
+ const t=selectedTower;
+ if(!t||t.type!=="echo"||t.sonic>0)return;
+ const damage=2500*t.level*t.interval*5;
+ for(const e of enemies){
+  if(distance(t,e)<=types.echo.range){
+   hitEnemy(e,damage,"echo");
+   if(e.hp>0)e.stun=3;
+  }
+ }
+ t.sonic=20;
+ particles.push({x:t.x,y:t.y,r:10,max:types.echo.range,life:.5,color:"#fff36a"});
+ updateUI();
+};
+
+function spawnEnemy(){
+ const boss=wave%50===0;
+ const hp=(10000+(wave-1)*500)*(boss?32:1);
+ enemies.push({
+  x:path[0].x,y:path[0].y,segment:0,progress:0,
+  hp,maxHP:hp,boss,speed:boss?24:35+Math.min(wave*.3,25),
+  stun:0
+ });
+}
+
+function hitEnemy(e,damage,source){
+ if(e.hp<=0)return;
+ const actual=Math.min(e.hp,damage);
+ e.hp-=actual;
+ particles.push({x:e.x,y:e.y,text:"-"+Math.floor(actual),life:.65,color:"#fff"});
+ if(source==="void"&&actual>0)baseHP+=50;
+ if(e.hp<=0){
+  money+=30+wave*2;
+  if(e.boss)money+=2500;
+  particles.push({x:e.x,y:e.y,text:"+$"+(30+wave*2+(e.boss?2500:0)),life:1,color:"#ffeb64"});
+ }
+}
+
+function buffs(){
+ towers.forEach(t=>t.buff=1);
+ towers.filter(t=>t.type==="scop").forEach(s=>{
+  towers.forEach(t=>{
+   if(t!==s&&t.type!=="scop"&&distance(s,t)<=types.scop.range)t.buff+=.5;
+  });
+ });
+}
+
+function update(dt){
+ if(!running)return;
+ if(spawnLeft>0){
+  spawnTimer-=dt;
+  if(spawnTimer<=0){
+   spawnEnemy();spawnLeft--;
+   spawnTimer=.75;
+  }
+ }
+ buffs();
+
+ towers.forEach(t=>{
+  t.cooldown=Math.max(0,t.cooldown-dt);
+  t.sonic=Math.max(0,t.sonic-dt);
+  if(t.type==="scop"||t.cooldown>0)return;
+  const data=types[t.type];
+  const target=enemies.filter(e=>e.hp>0&&distance(t,e)<=data.range)
+    .sort((a,b)=>b.segment-a.segment||b.progress-a.progress)[0];
+  if(target){
+   const damage=2500*t.level*data.interval*t.buff;
+   projectiles.push({x:t.x,y:t.y,target,damage,type:t.type,life:0});
+   t.cooldown=data.interval;
+  }
+ });
+
+ projectiles.forEach(p=>{
+  if(p.target.hp<=0){p.life=99;return;}
+  p.life+=dt;
+  if(p.life>=.12){
+   hitEnemy(p.target,p.damage,p.type);
+   p.life=99;
+  }
+ });
+ projectiles=projectiles.filter(p=>p.life<99);
+
+ enemies.forEach(e=>{
+  if(e.hp<=0)return;
+  if(e.stun>0){e.stun-=dt;return;}
+  let move=e.speed*dt;
+  while(move>0&&e.segment<path.length-1){
+   const a=path[e.segment],b=path[e.segment+1];
+   const d=distance(a,b);
+   const remaining=d-e.progress;
+   const step=Math.min(move,remaining);
+   e.progress+=step;move-=step;
+   const f=e.progress/d;
+   e.x=a.x+(b.x-a.x)*f;
+   e.y=a.y+(b.y-a.y)*f;
+   if(e.progress>=d){e.segment++;e.progress=0;}
+  }
+  if(e.segment>=path.length-1){
+   baseHP-=Math.ceil(e.hp);
+   e.hp=0;
+   particles.push({x:820,y:245,text:"-"+Math.ceil(e.hp||0),life:.8,color:"#ff5555"});
+  }
+ });
+ enemies=enemies.filter(e=>e.hp>0);
+
+ particles.forEach(p=>p.life-=dt);
+ particles=particles.filter(p=>p.life>0);
+
+ if(spawnLeft===0&&enemies.length===0){
+  if(wave>0){
+   money+=500+wave*35;
+   $("info").textContent="Wave "+wave+" cleared! You earned $"+(500+wave*35)+".";
+   if(nextWaveQueued)startWave();
+   else running=false;
+  }
+ }
+ if(baseHP<=0){
+  baseHP=0;running=false;
+  $("info").textContent="🌻 Your garden has fallen! Refresh the page to play again.";
+ }
+ updateUI();
+}
+
+function drawPath(){
+ ctx.lineCap="round";ctx.lineJoin="round";
+ ctx.strokeStyle="#9a7546";ctx.lineWidth=65;
+ ctx.beginPath();ctx.moveTo(path[0].x,path[0].y);
+ path.slice(1).forEach(p=>ctx.lineTo(p.x,p.y));ctx.stroke();
+ ctx.strokeStyle="#d6b47b";ctx.lineWidth=5;
+ ctx.setLineDash([15,15]);
+ ctx.stroke();ctx.setLineDash([]);
+}
+
+function draw(){
+ ctx.clearRect(0,0,900,490);
+ ctx.fillStyle="#8acb69";ctx.fillRect(0,0,900,490);
+ for(let x=20;x<900;x+=60)for(let y=20;y<490;y+=60){
+  ctx.fillStyle="rgba(255,255,255,.08)";
+  ctx.beginPath();ctx.arc(x,y,2,0,7);ctx.fill();
+ }
+ drawPath();
+ ctx.fillStyle="#ffdb70";ctx.beginPath();ctx.arc(820,245,32,0,7);ctx.fill();
+ ctx.font="25px Arial";ctx.fillText("🌻",802,254);
+
+ towers.forEach(t=>{
+  const d=types[t.type];
+  if(t.type==="scop"){
+   ctx.strokeStyle="rgba(50,255,130,.35)";
+   ctx.lineWidth=2;ctx.setLineDash([7,7]);
+   ctx.beginPath();ctx.arc(t.x,t.y,d.range,0,7);ctx.stroke();
+   ctx.setLineDash([]);
+  }
+  if(t===selectedTower){
+   ctx.strokeStyle="white";ctx.lineWidth=2;
+   ctx.beginPath();ctx.arc(t.x,t.y,d.range,0,7);ctx.stroke();
+  }
+  ctx.fillStyle="#294b2e";ctx.beginPath();ctx.arc(t.x,t.y,19,0,7);ctx.fill();
+  ctx.font="24px Arial";ctx.textAlign="center";
+  ctx.fillText(d.emoji,t.x,t.y+8);
+  ctx.fillStyle="white";ctx.font="12px Arial";
+  ctx.fillText("Lv."+t.level,t.x,t.y+32);
+  if(t.buff>1){
+   ctx.fillStyle="#b5ffb5";
+   ctx.fillText("+"+Math.round((t.buff-1)*100)+"%",t.x,t.y-25);
+  }
+ });
+
+ projectiles.forEach(p=>{
+  ctx.fillStyle=types[p.type].color;
+  ctx.beginPath();ctx.arc(p.x,p.y,6,0,7);ctx.fill();
+ });
+
+ enemies.forEach(e=>{
+  ctx.fillStyle=e.boss?"#531c68":"#bd3434";
+  ctx.beginPath();ctx.arc(e.x,e.y,e.boss?20:13,0,7);ctx.fill();
+  ctx.fillStyle="white";ctx.font="bold 12px Arial";ctx.textAlign="center";
+  ctx.fillText(e.boss?"👑":"👾",e.x,e.y+4);
+  const width=e.boss?65:42;
+  ctx.fillStyle="#333";ctx.fillRect(e.x-width/2,e.y-29,width,6);
+  ctx.fillStyle="#55ef55";
+  ctx.fillRect(e.x-width/2,e.y-29,width*Math.max(0,e.hp/e.maxHP),6);
+  ctx.fillStyle="white";ctx.font="11px Arial";
+  ctx.fillText(Math.ceil(e.hp).toLocaleString(),e.x,e.y-34);
+  if(e.stun>0){ctx.fillStyle="#fff36a";ctx.fillText("STUN",e.x,e.y-44);}
+ });
+
+ if(enemies.some(e=>e.boss)){
+  const boss=enemies.find(e=>e.boss);
+  ctx.fillStyle="#222";ctx.fillRect(220,10,460,17);
+  ctx.fillStyle="#e34aeb";ctx.fillRect(220,10,460*Math.max(0,boss.hp/boss.maxHP),17);
+  ctx.strokeStyle="white";ctx.strokeRect(220,10,460,17);
+  ctx.fillStyle="white";ctx.font="bold 12px Arial";
+  ctx.fillText("BOSS HP: "+Math.ceil(boss.hp).toLocaleString(),450,23);
+ }
+
+ particles.forEach(p=>{
+  if(p.text){
+   ctx.globalAlpha=Math.min(1,p.life*2);
+   ctx.fillStyle=p.color;ctx.font="bold 14px Arial";
+   ctx.fillText(p.text,p.x,p.y-20*(1-p.life));
+   ctx.globalAlpha=1;
+  }else{
+   ctx.strokeStyle=p.color;ctx.globalAlpha=p.life*2;
+   ctx.beginPath();ctx.arc(p.x,p.y,p.max*(1-p.life/.5),0,7);ctx.stroke();
+   ctx.globalAlpha=1;
+  }
+ });
+}
+
+function loop(time){
+ const dt=Math.min((time-lastTime)/1000||0,.05)*speed;
+ lastTime=time;
+ if(!paused)update(dt);
+ draw();
+ requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+updateUI();
+</script>
+</body>
+</html>
